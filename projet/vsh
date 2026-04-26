@@ -1,0 +1,628 @@
+#!/bin/bash
+
+BROWSE_HEADER="/tmp/vsh_header.$$"
+CURRENT_DIR="\\"
+
+########################################
+# OUTILS DE PARCOURS (debug / tests)
+########################################
+
+list_tree() {
+    find . -mindepth 1 | sed 's|^\./||'
+}
+
+list_dirs() {
+    find . -type d | sed 's|^\./||'
+}
+
+list_files() {
+    find . -type f | sed 's|^\./||'
+}
+
+########################################
+# ÉTAPE 1 — CONSTRUCTION DU BODY
+########################################
+# Le body contient UNIQUEMENT le contenu
+# des fichiers non vides.
+# L’ordre est crucial : offsets → lignes.
+########################################
+
+build_body() {
+    local BODY_FILE="$1"
+    > "$BODY_FILE"
+
+    # On parcourt les fichiers texte dans un ordre stable
+    find . -type f ! -name "*.arch" | sort | while read -r f; do
+        # On copie le contenu
+        cat "$f" >> "$BODY_FILE"
+        # On force un saut de ligne entre fichiers
+        # Peut etre le del plus tard apres les test
+        #echo >> "$BODY_FILE"
+    done
+}
+
+########################################
+# ÉTAPE 2 — CALCUL DES OFFSETS
+########################################
+# On associe à chaque fichier :
+# - taille réelle
+# - permissions textuelles
+# - ligne de début dans le body
+# - nombre de lignes
+########################################
+
+declare -A FILE_START
+declare -A FILE_LINES
+declare -A FILE_SIZE
+declare -A FILE_PERMS
+
+compute_offsets() {
+    local line=1
+    # On utilise < <(...) pour éviter le subshell du pipe
+    while read -r f; do
+        local lines
+        lines=$(wc -l < "$f")
+        # On ne compte pas de ligne vide supplémentaire si on veut être strict
+        # mais on s'assure que le fichier finit par un newline si besoin
+        
+        FILE_START["$f"]=$line
+        FILE_LINES["$f"]=$lines
+        FILE_SIZE["$f"]=$(stat -c "%s" "$f")
+        FILE_PERMS["$f"]=$(stat -c "%A" "$f")
+
+        line=$((line + lines))
+    done < <(find . -type f ! -name "*.arch" | sort)
+}
+
+########################################
+# ÉTAPE 3 — CONSTRUCTION DU HEADER
+########################################
+# Un bloc PAR RÉPERTOIRE
+########################################
+
+build_header() {
+    local HEADER_FILE="$1"
+    > "$HEADER_FILE"
+
+    while read -r dir; do
+        # On nettoie le nom du répertoire pour l'affichage
+        local dir_name="${dir#./}"
+        #Peut etre retirer plus :( 
+        [ "$dir_name" = "." ] && dir_name="root" # ou laisser vide selon ta préférence
+        
+        echo "directory $dir_name" >> "$HEADER_FILE"
+
+        while read -r item; do
+            local name=$(basename "$item")
+            local perms=$(stat -c "%A" "$item")
+            local size=$(stat -c "%s" "$item")
+
+            if [ -d "$item" ]; then
+                # Format Dossier : nom droits taille
+                echo "$name $perms $size" >> "$HEADER_FILE"
+            else
+                # Format Fichier : nom droits taille start lines
+                # On vérifie si les variables existent (cas des fichiers vides)
+                local start=${FILE_START["$item"]:-0}
+                local lns=${FILE_LINES["$item"]:-0}
+                
+                if [ "$size" -eq 0 ]; then
+                    echo "$name $perms $size" >> "$HEADER_FILE"
+                else
+                    echo "$name $perms $size $start $lns" >> "$HEADER_FILE"
+                fi
+            fi
+        done < <(find "$dir" -mindepth 1 -maxdepth 1 | sort)
+
+        echo "@" >> "$HEADER_FILE"
+    done < <(find . -type d | sort)
+}
+
+########################################
+# ÉTAPE 4 — PREMIÈRE LIGNE X:Y
+########################################
+# header commence ligne 2
+# body commence après le header
+########################################
+
+write_archive() {
+    local HEADER="$1"
+    local BODY="$2"
+    local OUT="$3"
+
+    local header_lines
+    header_lines=$(wc -l < "$HEADER")
+
+    local header_start=2
+    local body_start=$((header_lines + 2))
+
+    {
+        echo "$header_start:$body_start"
+        cat "$HEADER"
+        cat "$BODY"
+    } > "$OUT"
+}
+
+
+########################################
+# CONVERSION DES DROITS (Texte -> Octal)
+########################################
+# Transforme "-rw-r--r--" en "644"
+convert_perms() {
+    local p="$1"
+    local octal=""
+    # On boucle sur les 3 groupes de 3 caractères (rwx)
+    for i in 1 4 7; do
+        local val=0
+        [[ ${p:$i:1} == "r" ]] && val=$((val + 4))
+        [[ ${p:$((i+1)):1} == "w" ]] && val=$((val + 2))
+        [[ ${p:$((i+2)):1} == "x" ]] && val=$((val + 1))
+        octal="${octal}${val}"
+    done
+    echo "$octal"
+}
+
+# Transforme le chemin virtuel (\A\B) en chemin Header (root ou A\B)
+get_header_path() {
+    if [ "$CURRENT_DIR" = "\\" ]; then
+        echo "root"
+    else
+        # Enlever le premier \ pour le header
+        echo "${CURRENT_DIR#\\}"
+    fi
+}
+# Extrait la partie Header du fichier archive pour la navigation
+extract_header_only() {
+    local ARCHIVE_FILE="$1"
+    local HEADER_OUT="$2"
+
+    local first_line=$(head -n 1 "$ARCHIVE_FILE")
+    local h_start=$(echo "$first_line" | cut -d: -f1)
+    local b_start=$(echo "$first_line" | cut -d: -f2)
+
+    # On vérifie si les variables sont des nombres pour éviter les erreurs sed
+    if [[ "$h_start" =~ ^[0-9]+$ && "$b_start" =~ ^[0-9]+$ ]]; then
+        sed -n "${h_start},$((b_start-1))p" "$ARCHIVE_FILE" > "$HEADER_OUT"
+    else
+        echo "Erreur : Format d'archive invalide." >&2
+        exit 1
+    fi
+}
+vsh_pwd() {
+    echo "$CURRENT_DIR"
+}
+
+# --- LS : Version corrigée (Boolean 0/1 pour AWK) ---
+vsh_ls() {
+    local opt_a=0 opt_l=0 target=""
+    
+    # Analyse des options
+    while [[ "$1" == -* ]]; do
+        [[ "$1" == *a* ]] && opt_a=1
+        [[ "$1" == *l* ]] && opt_l=1
+        shift
+    done
+    
+    # Si après les options il reste un argument, c'est la cible, sinon dossier courant
+    target="${1:-$CURRENT_DIR}"
+    local search="${target#\\}"
+    [ -z "$search" ] && search="root"
+
+    local awk_path="${search//\\/\\\\}"
+
+    awk -v path="$awk_path" -v show_all="$opt_a" -v long="$opt_l" '
+    $1 == "directory" && $2 == path { found=1; next }
+    found && $1 == "@" { found=0; exit }
+    found {
+        name=$1; perms=$2; size=$3
+        
+        # Gestion des fichiers cachés
+        if (show_all == 0 && name ~ /^\./) next
+        
+        if (long == 1) {
+            # Format détaillé (ls -l)
+            printf "%-11s %-8s %s\n", perms, size, name
+        } else {
+            # Format court (ls par défaut) avec suffixes \ et *
+            suffix = ""
+            if (perms ~ /^d/) {
+                suffix = "\\"
+            } else if (perms ~ /x/) {
+                suffix = "*"
+            }
+            printf "%s%s  ", name, suffix
+        }
+    }
+    END { if (long == 0) print "" }' "$BROWSE_HEADER"
+}
+
+vsh_cd() {
+    local arg="$1"
+    local new_dir="$CURRENT_DIR"
+
+    # 1. Calcul du chemin cible
+    if [ -z "$arg" ] || [ "$arg" = "\\" ]; then
+        new_dir="\\"
+    elif [ "$arg" = ".." ]; then
+        new_dir="${CURRENT_DIR%\\*}"
+        [ -z "$new_dir" ] && new_dir="\\"
+    elif [[ "$arg" == \\* ]]; then
+        new_dir="$arg"
+    else
+        # On gère le cas de la racine pour ne pas avoir double slash (\\)
+        [[ "$CURRENT_DIR" == "\\" ]] && new_dir="\\$arg" || new_dir="$CURRENT_DIR\\$arg"
+    fi
+
+    # 2. Préparation de la recherche pour le Header
+    local search="${new_dir#\\}"
+    [ -z "$search" ] && search="root"
+    
+    # 3. FIX : On double les \ pour que grep ne les interprète pas comme des caractères spéciaux
+    local grep_search="${search//\\/\\\\}"
+    
+    # On vérifie si le bloc directory existe EXACTEMENT dans le header
+    if grep -q "^directory $grep_search$" "$BROWSE_HEADER"; then
+        CURRENT_DIR="$new_dir"
+    else
+        echo "vsh: cd: $arg: Aucun dossier de ce nom"
+    fi
+}
+
+# --- CAT : Gère plusieurs fichiers (cat f1 f2) ---
+vsh_cat() {
+    [ $# -eq 0 ] && return
+    for full_path in "$@"; do
+        # On sépare le nom du fichier du chemin du dossier
+        local dir_part="${full_path%\\*}"
+        local file_name="${full_path##*\\}"
+        
+        local final_dir
+        # Cas 1 : Chemin absolu
+        if [[ "$full_path" == \\* ]]; then
+            final_dir="$dir_part"
+        # Cas 2 : Chemin relatif avec un dossier (ex: DossierA\fich.txt)
+        elif [[ "$full_path" == *\\* ]]; then
+            [[ "$CURRENT_DIR" == "\\" ]] && final_dir="\\$dir_part" || final_dir="$CURRENT_DIR\\$dir_part"
+        # Cas 3 : Fichier dans le dossier courant
+        else
+            final_dir="$CURRENT_DIR"
+        fi
+
+        # Traduction pour le header
+        local search="${final_dir#\\}"
+        [ -z "$search" ] && search="root"
+
+        # Recherche des infos du fichier via AWK
+        local file_info=$(awk -v path="${search//\\/\\\\}" -v fname="$file_name" '
+            $1=="directory" && $2==path{found=1;next} 
+            found && $1=="@"{found=0;next} 
+            found && $1==fname{print $4 " " $5; exit}' "$BROWSE_HEADER")
+        
+        if [ -n "$file_info" ]; then
+            local start=$(echo $file_info | cut -d' ' -f1)
+            local lines=$(echo $file_info | cut -d' ' -f2)
+            [ "$start" = "0" ] && continue
+            
+            local body_line=$(head -n 1 "$BROWSE_ARCHIVE" | cut -d: -f2)
+            local real_start=$((body_line + start - 1))
+            sed -n "${real_start},$((real_start + lines - 1))p" "$BROWSE_ARCHIVE"
+        else
+            echo "vsh: cat: $full_path: Fichier introuvable"
+        fi
+    done
+}
+vsh_touch() {
+    local filename="$1"
+    [ -z "$filename" ] && { echo "usage: touch <nom_fichier>"; return; }
+
+    local search=$(get_header_path)
+    # Vérification
+    if vsh_ls | grep -qw "$filename"; then return; fi
+
+    # Utilisation du remplacement de @ par (nouveau_fichier + @)
+    sed -i "/^directory $search$/,/^@/ s/^@$/$filename -rw-r--r-- 0\n@/" "$BROWSE_HEADER"
+    echo "  [TOUCH] $filename créé."
+}
+
+# --- MKDIR : Gère l'option -p (récursif) ---
+vsh_mkdir() {
+    local p_flag=false
+    [[ "$1" == "-p" ]] && p_flag=true && shift
+    local input_path="$1"
+    [ -z "$input_path" ] && { echo "usage: mkdir [-p] path"; return; }
+
+    local current_base
+    # Si le chemin commence par \, c'est un chemin absolu, on part de la racine
+    if [[ "$input_path" == \\* ]]; then
+        current_base="\\"
+        input_path="${input_path#\\}" # On enlève le \ initial pour la boucle
+    else
+        # Sinon, c'est un chemin relatif, on part du dossier courant
+        current_base="$CURRENT_DIR"
+    fi
+
+    # On découpe le chemin en morceaux (A\B\C -> A B C)
+    local parts=$(echo "$input_path" | tr '\\' ' ')
+
+    for part in $parts; do
+        [ -z "$part" ] && continue
+        local search="${current_base#\\}"
+        [ -z "$search" ] && search="root"
+        
+        # 1. On vérifie si le dossier existe déjà dans le répertoire parent
+        if ! vsh_ls "$current_base" | grep -qw "$part"; then
+            # On insère l'entrée dans le bloc du parent juste avant le @
+            sed -i "/^directory $search$/,/^@/ s/^@$/$part drwxr-xr-x 4096\n@/" "$BROWSE_HEADER"
+            
+            # 2. On prépare le chemin complet du nouveau dossier pour son propre bloc
+            local new_dir_path
+            [ "$current_base" = "\\" ] && new_dir_path="$part" || new_dir_path="${search}\\$part"
+            
+            # On crée le bloc "directory ..." s'il n'existe pas encore
+            if ! grep -q "^directory ${new_dir_path//\\/\\\\}$" "$BROWSE_HEADER"; then
+                echo -e "directory $new_dir_path\n@" >> "$BROWSE_HEADER"
+            fi
+            echo "  [MKDIR] Répertoire '$part' créé dans '$current_base'."
+        fi
+        
+        # On descend dans le dossier créé pour le tour de boucle suivant (important pour -p)
+        [[ "$current_base" == "\\" ]] && current_base="\\$part" || current_base="$current_base\\$part"
+        $p_flag || break
+    done
+}
+
+# --- RM : Supprime un fichier ou un dossier (récursif) ---
+vsh_rm() {
+    local full_path="$1"
+    [ -z "$full_path" ] && { echo "usage: rm path"; return; }
+    
+    # Séparation chemin/nom
+    local dir_part="${full_path%\\*}"
+    local target_name="${full_path##*\\}"
+    
+    local parent_dir
+    if [[ "$full_path" == \\* ]]; then
+        parent_dir="$dir_part"
+    elif [[ "$full_path" == *\\* ]]; then
+        [[ "$CURRENT_DIR" == "\\" ]] && parent_dir="\\$dir_part" || parent_dir="$CURRENT_DIR\\$dir_part"
+    else
+        parent_dir="$CURRENT_DIR"
+    fi
+
+    local search="${parent_dir#\\}"
+    [ -z "$search" ] && search="root"
+    
+    # 1. On vérifie la présence dans le header
+    if ! vsh_ls "$parent_dir" | grep -qw "$target_name"; then
+        echo "vsh: rm: $full_path: Aucun fichier ou dossier de ce nom"
+        return
+    fi
+
+    # 2. On calcule le chemin complet de l'élément à supprimer pour nettoyer les blocs
+    local full_target_path
+    [ "$parent_dir" = "\\" ] && full_target_path="$target_name" || full_target_path="${search}\\$target_name"
+
+    # 3. Supprimer la ligne dans le bloc parent
+    sed -i "/^directory $search$/,/^@/ { /^$target_name / d }" "$BROWSE_HEADER"
+    
+    # 4. Supprimer le bloc de l'élément lui-même (si c'était un répertoire) et ses sous-blocs
+    # On utilise un regex pour attraper le dossier et ses enfants
+    sed -i "/^directory ${full_target_path//\\/\\\\}/,/^@/ d" "$BROWSE_HEADER"
+
+    echo "  [RM] '$full_path' a été supprimé."
+}
+
+vsh_save() {
+    echo "Sauvegarde des modifications dans l'archive..."
+
+    local TMP_NEW_ARCH="/tmp/new_archive.$$"
+    local OLD_BODY="/tmp/old_body.$$"
+
+    # 1. Extraire le BODY actuel de l'archive d'origine
+    # On lit la première ligne pour savoir où commence le body
+    local first_line=$(head -n 1 "$BROWSE_ARCHIVE")
+    local body_start=$(echo "$first_line" | cut -d: -f2)
+    
+    # On récupère tout à partir de body_start jusqu'à la fin
+    sed -n "${body_start},\$p" "$BROWSE_ARCHIVE" > "$OLD_BODY"
+
+    # 2. Calculer les nouveaux offsets pour la ligne 1
+    local header_lines=$(wc -l < "$BROWSE_HEADER")
+    local new_h_start=2
+    local new_b_start=$((header_lines + 2))
+
+    # 3. Réassembler le tout
+    {
+        echo "$new_h_start:$new_b_start"
+        cat "$BROWSE_HEADER"
+        cat "$OLD_BODY"
+    } > "$TMP_NEW_ARCH"
+
+    # 4. Remplacer l'archive d'origine
+    mv "$TMP_NEW_ARCH" "$BROWSE_ARCHIVE"
+    
+    rm -f "$OLD_BODY"
+    echo "✅ Archive mise à jour avec succès."
+}
+
+
+
+
+########################################
+# EXTRACTION LOCALE DE L'ARCHIVE : Ne fonctionne pas
+########################################
+client_extract_logic() {
+    local TMP_ARCH="/tmp/archive_recv.$$"
+    cat > "$TMP_ARCH"
+
+    # 1. Extraction sécurisée de la ligne X:Y (Ligne 1)
+    local first_line=$(sed -n '1p' "$TMP_ARCH")
+    local header_start=$(echo "$first_line" | cut -d: -f1)
+    local body_start=$(echo "$first_line" | cut -d: -f2)
+
+    # Vérification de validité
+    if ! [[ "$header_start" =~ ^[0-9]+$ && "$body_start" =~ ^[0-9]+$ ]]; then
+        echo "ERREUR: archive invalide ou flux corrompu (Ligne 1: $first_line)" >&2
+        rm -f "$TMP_ARCH"
+        return
+    fi
+
+    local HEADER="/tmp/header.$$"
+    local BODY="/tmp/body.$$"
+
+    # 2. Séparation Header / Body
+    sed -n "${header_start},$((body_start-1))p" "$TMP_ARCH" > "$HEADER"
+    sed -n "${body_start},\$p" "$TMP_ARCH" > "$BODY"
+
+    local current_dir="."
+
+    # 3. Parcours du Header
+    while read -r line; do
+        # On ignore les marqueurs de fin de bloc
+        [ "$line" = "@" ] && continue
+
+        # Cas d'un nouveau répertoire
+        if [[ "$line" == directory* ]]; then
+            current_dir=$(echo "$line" | cut -d' ' -f2- | tr '\\' '/')
+            mkdir -p "$current_dir"
+            continue
+        fi
+
+        # Lecture des métadonnées du fichier/sous-dossier
+        # L'IFS par défaut (espace) découpe ici correctement la ligne
+        read -r name perms size start lines <<< "$line"
+
+        local target="$current_dir/$name"
+
+        # Cas A : C'est un répertoire listé dans le bloc
+        if [[ "$perms" == d* ]]; then
+            mkdir -p "$target"
+            chmod $(convert_perms "$perms") "$target"
+            continue
+        fi
+
+        # Cas B : C'est un fichier vide
+        if [ "$size" -eq 0 ]; then
+            touch "$target"
+        # Cas C : C'est un fichier avec contenu
+        else
+            sed -n "${start},$((start + lines - 1))p" "$BODY" > "$target"
+        fi
+
+        # 4. Application des droits (Obligatoire selon le sujet)
+        local mode=$(convert_perms "$perms")
+        chmod "$mode" "$target"
+        
+        echo "  [EXTRACT] $target (Mode: $mode)"
+
+    done < "$HEADER"
+
+    # Comptage pour le message final
+    local nb_files=$(find . -type f | wc -l)
+    local nb_dirs=$(find . -type d | wc -l)
+
+    # Nettoyage
+    rm -f "$TMP_ARCH" "$HEADER" "$BODY"
+
+    echo "-----------------------------------------------"
+    echo "✅ EXTRACTION RÉUSSIE !"
+    echo "  -> $nb_files fichiers restaurés"
+    echo "  -> $nb_dirs dossiers créés"
+    echo "  -> Emplacement : $(pwd)"
+    echo "-----------------------------------------------"
+}
+
+
+########################################
+# CLIENT
+########################################
+
+main() {
+    if [ $# -lt 1 ]; then
+        echo "usage: vsh -list HOST PORT | -create HOST PORT ARCHIVE | -browse ARCHIVE"
+        exit 1
+    fi
+
+    ACTION="$1"
+    shift # On enlève l'action ($1) de la liste des arguments
+
+    case "$ACTION" in
+        -list)
+            [ $# -lt 2 ] && echo "usage: vsh -list HOST PORT" && exit 1
+            HOST="$1"
+            PORT="$2"
+            echo "LIST" | nc "$HOST" "$PORT"
+            ;;
+        -create)
+            [ $# -lt 3 ] && echo "usage: vsh -create HOST PORT ARCHIVE" && exit 1
+            HOST="$1"
+            PORT="$2"
+            ARCHIVE="$3"
+
+            TMP_BODY="/tmp/body.$$"
+            TMP_HEADER="/tmp/header.$$"
+            TMP_ARCHIVE="/tmp/archive.$$"
+
+            build_body "$TMP_BODY"
+            compute_offsets
+            build_header "$TMP_HEADER"
+            write_archive "$TMP_HEADER" "$TMP_BODY" "$TMP_ARCHIVE"
+
+            (
+                echo "CREATE $(basename "$ARCHIVE")"
+                cat "$TMP_ARCHIVE"
+            ) | timeout 2 nc "$HOST" "$PORT" ########
+
+            rm -f "$TMP_BODY" "$TMP_HEADER" "$TMP_ARCHIVE"
+            ;;
+        -browse)
+            [ $# -lt 1 ] && echo "usage: vsh -browse ARCHIVE" && exit 1
+            ARCHIVE="$1"
+            [ ! -f "$ARCHIVE" ] && echo "archive introuvable: $ARCHIVE" && exit 1
+
+            # On stocke le chemin de l'archive pour que cat puisse y lire
+            BROWSE_ARCHIVE="$(realpath "$ARCHIVE")"
+            extract_header_only "$ARCHIVE" "$BROWSE_HEADER"
+            CURRENT_DIR="\\"
+
+            while true; do
+                echo -n "vsh:> "
+                read -r cmd arg rest  # rest permet de gérer les options comme -l
+                case "$cmd" in
+                    pwd) vsh_pwd ;;
+                    cd)  vsh_cd "$arg" ;;
+                    ls)  vsh_ls "$arg" "$rest" ;;
+                    cat) vsh_cat "$arg" $rest;;
+                    touch) vsh_touch "$arg" ;;
+                    mkdir) vsh_mkdir "$arg" "$rest";;
+                    rm)    vsh_rm "$arg" ;;
+                    save)  vsh_save ;;  # Commande manuelle
+                    exit) 
+                        echo -n "Voulez-vous sauvegarder les modifications ? (y/n) "
+                        read -r answer
+                        [ "$answer" = "y" ] && vsh_save
+                        rm -f "$BROWSE_HEADER"
+                        break 
+                        ;;
+                    "")    ;; 
+                    *)     echo "commande inconnue: $cmd" ;;
+                esac
+            done
+            ;;
+
+
+        -extract)
+            ARCHIVE="$1"
+            [ -z "$ARCHIVE" ] && echo "archive manquante" && exit 1
+
+            echo "EXTRACT $ARCHIVE" | timeout 2 nc "$HOST" "$PORT" | client_extract_logic
+            ;;
+        *)
+            echo "commande inconnue"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
